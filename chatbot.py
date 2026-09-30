@@ -1,0 +1,469 @@
+"""
+어업·농업인을 위한 날씨 챗봇 (기본 버전)
+
+기상청 단기예보 조회서비스(VilageFcstInfoService_2.0 / getVilageFcst)를 사용해
+"내일 새벽 5시 출항해도 돼?", "모레 농약 쳐도 돼?" 같은 질문에
+'작업을 해도 되는지, 무엇을 조심해야 하는지'로 답합니다.
+
+실행 전: .env 파일에 KMA_SERVICE_KEY=발급받은키 를 넣어주세요.
+
+※ 판단 기준은 참고용 규칙입니다. 실제 출항 여부는 기상특보와 해경 통제를 따라야 합니다.
+"""
+
+import math
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+SERVICE_KEY = os.getenv("KMA_SERVICE_KEY")
+ENDPOINT = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
+
+# (이름, 질문에서 알아들을 단어들, 위도, 경도) - 필요하면 여기에 장소를 추가하세요
+PLACES = [
+    ("무안", ["무안"], 34.9904, 126.4817),
+    ("목포항", ["목포"], 34.7852, 126.3834),
+    ("해남", ["해남"], 34.5733, 126.5989),
+    ("제주시", ["제주시", "제주"], 33.4996, 126.5312),
+    ("한림항", ["한림"], 33.4145, 126.2656),
+    ("성산포항", ["성산"], 33.4731, 126.9306),
+    ("서귀포항", ["서귀포"], 33.2393, 126.5626),
+]
+DEFAULT_PLACE = PLACES[0]
+
+# 기상특보 조회서비스 (공공데이터포털에서 따로 활용신청 필요)
+WARN_ENDPOINT = "https://apis.data.go.kr/1360000/WthrWrnInfoService/getPwnStatus"
+
+# 장소별로 확인할 특보구역 이름 (특보 문장에 이 단어가 들어 있으면 해당 지역 특보로 봄)
+# 구역 이름이 실제와 다르면 '특보 전체'를 입력해 원문을 보고 여기를 고치세요.
+WARN_AREAS = {
+    "무안": ["무안", "전남북부서해앞바다"],
+    "목포항": ["목포", "전남북부서해앞바다", "서해남부북쪽안쪽먼바다"],
+    "해남": ["해남", "전남남부서해앞바다", "서해남부남쪽안쪽먼바다"],
+    "제주시": ["제주도북부", "제주도북부앞바다"],
+    "한림항": ["제주도서부", "제주도서부앞바다"],
+    "성산포항": ["제주도동부", "제주도동부앞바다"],
+    "서귀포항": ["제주도남부", "제주도남부앞바다", "제주도남쪽안쪽먼바다"],
+}
+WARN_WORDS = ["특보", "주의보", "경보"]
+
+FISHING_WORDS = ["출항", "조업", "배 띄", "바다", "파도", "물때", "낚시", "어업", "고기잡"]
+FARMING_WORDS = ["농약", "방제", "살포", "밭", "논", "수확", "하우스", "서리", "농사", "농업", "파종", "건조", "말리"]
+
+SKY = {"1": "맑음", "3": "구름많음", "4": "흐림"}
+PTY = {"0": "없음", "1": "비", "2": "비/눈", "3": "눈", "4": "소나기"}
+BASE_HOURS = [2, 5, 8, 11, 14, 17, 20, 23]  # 단기예보 발표 시각
+WORK_HOURS = 6  # 시각을 말하면 그 시각부터 몇 시간 동안의 날씨를 볼지
+
+# ---------------------------------------------------------------------------
+# 1. 위도/경도 -> 기상청 격자(nx, ny) 변환 (기상청 제공 LCC 변환식)
+# ---------------------------------------------------------------------------
+def latlon_to_grid(lat, lon):
+    RE, GRID = 6371.00877, 5.0
+    SLAT1, SLAT2, OLON, OLAT = 30.0, 60.0, 126.0, 38.0
+    XO, YO = 43, 136
+    DEGRAD = math.pi / 180.0
+
+    re_ = RE / GRID
+    slat1, slat2 = SLAT1 * DEGRAD, SLAT2 * DEGRAD
+    olon, olat = OLON * DEGRAD, OLAT * DEGRAD
+
+    sn = math.tan(math.pi * 0.25 + slat2 * 0.5) / math.tan(math.pi * 0.25 + slat1 * 0.5)
+    sn = math.log(math.cos(slat1) / math.cos(slat2)) / math.log(sn)
+    sf = math.tan(math.pi * 0.25 + slat1 * 0.5)
+    sf = (sf ** sn) * math.cos(slat1) / sn
+    ro = math.tan(math.pi * 0.25 + olat * 0.5)
+    ro = re_ * sf / (ro ** sn)
+
+    ra = math.tan(math.pi * 0.25 + lat * DEGRAD * 0.5)
+    ra = re_ * sf / (ra ** sn)
+    theta = lon * DEGRAD - olon
+    if theta > math.pi:
+        theta -= 2.0 * math.pi
+    if theta < -math.pi:
+        theta += 2.0 * math.pi
+    theta *= sn
+
+    x = math.floor(ra * math.sin(theta) + XO + 0.5)
+    y = math.floor(ro - ra * math.cos(theta) + YO + 0.5)
+    return x, y
+
+
+# ---------------------------------------------------------------------------
+# 2. 기상청 API 호출
+# ---------------------------------------------------------------------------
+def latest_base(now):
+    """지금 조회 가능한 가장 최근 발표 시각 (발표 후 약 10분 뒤부터 제공)"""
+    t = now - timedelta(minutes=10)
+    for h in reversed(BASE_HOURS):
+        if t.hour >= h:
+            return t.strftime("%Y%m%d"), f"{h:02d}00"
+    prev = t - timedelta(days=1)
+    return prev.strftime("%Y%m%d"), "2300"
+
+
+_cache = {}
+
+
+def fetch_forecast(nx, ny, now):
+    """{(날짜, 시각): {카테고리: 값}} 형태로 예보를 돌려줍니다."""
+    base_date, base_time = latest_base(now)
+    cache_key = (nx, ny, base_date, base_time)
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    params = {
+        "serviceKey": SERVICE_KEY,
+        "pageNo": 1,
+        "numOfRows": 1500,
+        "dataType": "JSON",
+        "base_date": base_date,
+        "base_time": base_time,
+        "nx": nx,
+        "ny": ny,
+    }
+    res = requests.get(ENDPOINT, params=params, timeout=10)
+    res.raise_for_status()
+
+    try:
+        data = res.json()
+    except ValueError:
+        # 키가 아직 등록 전이거나 잘못되면 XML 오류 메시지가 옵니다
+        raise RuntimeError(
+            "API가 예상과 다른 응답을 보냈어요. 키 발급 직후라면 1시간쯤 뒤에 다시 해보세요.\n"
+            + res.text[:300]
+        )
+
+    header = data["response"]["header"]
+    if header["resultCode"] != "00":
+        raise RuntimeError(f"API 오류 {header['resultCode']}: {header['resultMsg']}")
+
+    forecast = {}
+    for item in data["response"]["body"]["items"]["item"]:
+        key = (item["fcstDate"], item["fcstTime"])
+        forecast.setdefault(key, {})[item["category"]] = item["fcstValue"]
+
+    _cache[cache_key] = forecast
+    return forecast
+
+
+
+# ---------------------------------------------------------------------------
+# 2-1. 기상특보 현황 (지금 발효 중인 특보 + 예비특보)
+# ---------------------------------------------------------------------------
+_warn_cache = {"time": None, "data": None}
+
+
+def fetch_warnings(now):
+    """최신 특보현황 원문을 {'t6': 발효 중 특보, 't7': 예비특보, 'tmFc': 발표시각}으로 돌려줍니다."""
+    if _warn_cache["time"] and now - _warn_cache["time"] < timedelta(minutes=10):
+        return _warn_cache["data"]
+
+    params = {"serviceKey": SERVICE_KEY, "pageNo": 1, "numOfRows": 10, "dataType": "JSON"}
+    res = requests.get(WARN_ENDPOINT, params=params, timeout=10)
+    res.raise_for_status()
+    try:
+        data = res.json()
+    except ValueError:
+        raise RuntimeError(
+            "특보 API가 예상과 다른 응답을 보냈어요. 공공데이터포털에서 "
+            "'기상청_기상특보 조회서비스'도 활용신청했는지 확인해주세요.\n" + res.text[:300]
+        )
+
+    header = data["response"]["header"]
+    if header["resultCode"] != "00":
+        raise RuntimeError(f"특보 API 오류 {header['resultCode']}: {header['resultMsg']}")
+
+    items = data["response"]["body"]["items"]["item"]
+    latest = max(items, key=lambda it: int(it.get("tmFc", 0)))  # 순서가 아니라 발표시각으로 최신 선택
+    result = {"t6": latest.get("t6", ""), "t7": latest.get("t7", ""), "tmFc": str(latest.get("tmFc", ""))}
+    _warn_cache.update(time=now, data=result)
+    return result
+
+
+def parse_active(t6):
+    """'o 풍랑주의보 : 구역1, 구역2' 줄들 -> [(특보이름, 구역문자열), ...]"""
+    result = []
+    for line in re.split(r"[\r\n]+", t6 or ""):
+        line = line.strip().lstrip("o").strip()
+        if ":" not in line:
+            continue
+        name, areas = line.split(":", 1)
+        result.append((name.strip(), areas.strip()))
+    return result
+
+
+def parse_preliminary(t7):
+    """'(1) 풍랑 예비특보' 제목 아래 'o 시각 : 구역' 줄들 -> [(제목, 시각, 구역), ...]"""
+    result, title = [], ""
+    for line in re.split(r"[\r\n]+", t7 or ""):
+        line = line.strip()
+        if re.match(r"\(\d+\)", line):
+            title = re.sub(r"^\(\d+\)\s*", "", line)
+        elif ":" in line:
+            when, areas = line.lstrip("o").strip().split(":", 1)
+            result.append((title, when.strip(), areas.strip()))
+    return result
+
+
+def warnings_for(place_name, warn):
+    """해당 장소에 걸린 특보만 골라냅니다."""
+    keys = WARN_AREAS.get(place_name, [place_name])
+    active = [(n, a) for n, a in parse_active(warn["t6"]) if any(k in a for k in keys)]
+    prelim = [(t, w, a) for t, w, a in parse_preliminary(warn["t7"]) if any(k in a for k in keys)]
+    return active, prelim
+
+
+def warning_lines(place_name, warn):
+    active, prelim = warnings_for(place_name, warn)
+    tm = warn["tmFc"]
+    stamp = f"{tm[4:6]}/{tm[6:8]} {tm[8:10]}:{tm[10:12]} 발표" if len(tm) >= 12 else "최신 발표"
+    lines = [f"📢 기상특보 ({stamp} 기준)"]
+    if active:
+        lines += [f"🚨 {name} 발효 중" for name, _ in active]
+    else:
+        lines.append("발효 중인 특보 없음")
+    for title, when, _ in prelim:
+        lines.append(f"🔔 {title}: {when} 발효 예정")
+    return lines, active, prelim
+
+
+# ---------------------------------------------------------------------------
+# 3. 질문 이해하기 (규칙 기반)
+# ---------------------------------------------------------------------------
+def parse_question(text, now):
+    # 날짜
+    day_offset = 0
+    if "글피" in text:
+        day_offset = 3
+    elif "모레" in text:
+        day_offset = 2
+    elif "내일" in text:
+        day_offset = 1
+    target_date = (now + timedelta(days=day_offset)).date()
+
+    # 시각
+    hour = None
+    m = re.search(r"(\d{1,2})\s*시", text)
+    if m:
+        hour = int(m.group(1)) % 24
+        if any(w in text for w in ["오후", "저녁", "밤"]) and hour < 12:
+            hour += 12
+    elif "새벽" in text:
+        hour = 4
+    elif "아침" in text:
+        hour = 7
+    elif "점심" in text:
+        hour = 12
+    elif "오후" in text:
+        hour = 14
+    elif "저녁" in text:
+        hour = 18
+
+    # 장소 (가장 길게 일치하는 단어 기준)
+    place = DEFAULT_PLACE
+    best_len = 0
+    for p in PLACES:
+        for word in p[1]:
+            if word in text and len(word) > best_len:
+                place, best_len = p, len(word)
+
+    # 어업 / 농업 / 둘 다
+    fishing = any(w in text for w in FISHING_WORDS)
+    farming = any(w in text for w in FARMING_WORDS)
+    if fishing and not farming:
+        mode = "어업"
+    elif farming and not fishing:
+        mode = "농업"
+    else:
+        mode = "전체"
+
+    return place, target_date, hour, mode
+
+
+# ---------------------------------------------------------------------------
+# 4. 예보 정리
+# ---------------------------------------------------------------------------
+def to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def rain_mm(pcp):
+    """PCP 값('강수없음', '1mm 미만', '2.0mm', '30.0~50.0mm') -> 숫자(mm)"""
+    if not pcp or "없음" in pcp:
+        return 0.0
+    if "미만" in pcp:
+        return 0.5
+    m = re.search(r"\d+(\.\d+)?", pcp)
+    return float(m.group()) if m else 0.0
+
+
+def summarize(hours):
+    """[(시, 예보dict), ...] -> 판단에 필요한 값들"""
+    temps = [to_float(v["TMP"]) for _, v in hours if "TMP" in v]
+    waves = [to_float(v["WAV"]) for _, v in hours if "WAV" in v]
+    rain_hours = [h for h, v in hours if v.get("PTY", "0") != "0" or to_float(v.get("POP")) >= 60]
+    return {
+        "tmin": min(temps) if temps else None,
+        "tmax": max(temps) if temps else None,
+        "wsd": max((to_float(v.get("WSD")) for _, v in hours), default=0.0),
+        "wav": max(waves) if waves else None,  # 바다가 아닌 격자면 파고가 없을 수 있음
+        "pop": max((int(to_float(v.get("POP"))) for _, v in hours), default=0),
+        "rain_total": sum(rain_mm(v.get("PCP")) for _, v in hours),
+        "rain_hours": rain_hours,
+        "sky": SKY.get(hours[0][1].get("SKY", ""), ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. 판단 규칙
+# ---------------------------------------------------------------------------
+def fishing_advice(s, is_today=True, active=None, prelim=None):
+    """실제 특보를 우선 반영하고, 그다음 풍랑주의보 기준(풍속 14m/s, 파고 3m)으로 판단"""
+    wsd, wav = s["wsd"], s["wav"]
+    wav_text = f"{wav}m" if wav is not None else "정보 없음"
+    head = f"🚢 어업 | 최대 풍속 {wsd}m/s, 최대 파고 {wav_text}"
+    sea_active = [n for n, _ in (active or []) if "풍랑" in n]
+    sea_prelim = [t for t, _, _ in (prelim or []) if "풍랑" in t]
+
+    if is_today and sea_active:
+        verdict = f"⛔ 출항 금지: {sea_active[0]}가 발효 중이에요."
+    elif wsd >= 14 or (wav is not None and wav >= 3):
+        verdict = "⛔ 출항 위험: 풍랑주의보 수준의 바람·파도예요. 출항하지 마세요."
+    elif sea_active:
+        verdict = "⚠️ 출항 주의: 지금 풍랑특보가 발효 중이에요. 해제됐는지 출발 전에 다시 물어보세요."
+    elif sea_prelim:
+        verdict = "⚠️ 출항 주의: 풍랑 예비특보가 있어요. 특보로 바뀔 수 있으니 출발 전에 다시 확인하세요."
+    elif wsd >= 9 or (wav is not None and wav >= 2):
+        verdict = "⛔ 출항 위험: 풍랑주의보 수준의 바람·파도예요. 출항하지 마세요."
+    elif wsd >= 9 or (wav is not None and wav >= 2):
+        verdict = "⚠️ 출항 주의: 소형 어선은 위험할 수 있어요. 가까운 바다에서 짧게 조업하세요."
+    else:
+        verdict = "✅ 출항 양호: 바람과 파도가 잔잔한 편이에요."
+
+    lines = [head, verdict]
+    if s["rain_hours"]:
+        lines.append(f"☔ {s['rain_hours'][0]}시~{s['rain_hours'][-1]}시 비 소식, 시야와 갑판 미끄럼에 주의하세요.")
+    if wav is None:
+        lines.append("ℹ️ 이 지점은 파고 예보가 없어요. 해상예보를 함께 확인하세요.")
+    return lines
+
+
+def farming_advice(s, date_is_whole_day):
+    lines = [f"🌾 농업 | 기온 {s['tmin']:.0f}~{s['tmax']:.0f}°C, 최대 풍속 {s['wsd']}m/s, 강수확률 최대 {s['pop']}%"]
+
+    # 농약 살포: 비가 오면 씻겨 내려가고, 바람이 세면 날려서 옆 밭에 피해
+    if s["rain_hours"]:
+        lines.append(f"🧪 농약 살포 ✗: {s['rain_hours'][0]}시쯤부터 비 소식이 있어 약이 씻겨 내려가요.")
+    elif s["wsd"] >= 4:
+        lines.append(f"🧪 농약 살포 ✗: 바람({s['wsd']}m/s)이 세서 약이 날려요. 바람 잦을 때 하세요.")
+    else:
+        lines.append("🧪 농약 살포 ○: 비 없고 바람도 약해서 방제하기 좋아요.")
+
+    # 수확물 건조
+    if s["rain_hours"] or s["pop"] >= 30:
+        lines.append("🌶️ 건조 작업 ✗: 비 가능성이 있어요. 말리던 작물은 덮어두세요.")
+
+    # 비가 많이 오면 배수 점검
+    if s["rain_total"] >= 30:
+        lines.append(f"💧 예상 강수량 약 {s['rain_total']:.0f}mm - 배수로를 미리 점검하세요.")
+
+    # 강풍: 비닐하우스
+    if s["wsd"] >= 9:
+        lines.append("💨 강풍 주의: 비닐하우스 고정끈과 출입문을 점검하세요.")
+
+    # 서리 / 폭염 (하루 전체를 볼 때만 의미 있음)
+    if date_is_whole_day and s["tmin"] is not None and s["tmin"] <= 3:
+        lines.append(f"❄️ 서리 주의: 최저 {s['tmin']:.0f}°C - 보온 덮개를 준비하세요.")
+    if s["tmax"] is not None and s["tmax"] >= 33:
+        lines.append(f"🥵 폭염 주의: 최고 {s['tmax']:.0f}°C - 한낮 작업은 피하고 물을 자주 드세요.")
+    return lines
+
+
+def answer(question, now=None):
+    now = now or datetime.now(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
+    place, target_date, hour, mode = parse_question(question, now)
+    name, _, lat, lon = place
+
+    # "특보", "주의보", "경보"를 물으면 특보만 바로 알려줌 (전화로 확인하던 걸 대신)
+    if any(w in question for w in WARN_WORDS):
+        warn = fetch_warnings(now)
+        if "전체" in question:
+            return f"[전국 특보 원문]\n{warn['t6']}\n\n[예비특보 원문]\n{warn['t7']}"
+        lines, _, _ = warning_lines(name, warn)
+        return f"[{name}]\n" + "\n".join(lines)
+
+    nx, ny = latlon_to_grid(lat, lon)
+    fc = fetch_forecast(nx, ny, now)
+    date_str = target_date.strftime("%Y%m%d")
+
+    day_hours = sorted((int(t[:2]), v) for (d, t), v in fc.items() if d == date_str)
+    if hour is not None:
+        hours = [(h, v) for h, v in day_hours if hour <= h < hour + WORK_HOURS]
+        period = f"{hour}시~{hour + WORK_HOURS}시"
+        whole_day = False
+    else:
+        start = now.hour if target_date == now.date() else 0
+        hours = [(h, v) for h, v in day_hours if h >= start]
+        period = "하루" if start == 0 else f"{start}시 이후"
+        whole_day = start == 0
+
+    if not hours:
+        return f"{name} 해당 시간 예보가 아직 없거나 이미 지난 시간이에요. (단기예보는 약 3~4일 뒤까지 제공돼요)"
+
+    s = summarize(hours)
+    lines = [f"[{name} {date_str[4:6]}/{date_str[6:]} {period}] {s['sky']}"]
+
+    # 어업 질문이면 특보도 자동으로 확인 (특보는 '지금' 기준이라 오늘이 아니면 주의로만 반영)
+    active, prelim = [], []
+    if mode in ("어업", "전체"):
+        try:
+            warn_lines, active, prelim = warning_lines(name, fetch_warnings(now))
+            lines += warn_lines
+        except Exception as e:
+            lines.append(f"📢 특보 확인 실패: {str(e).splitlines()[0]}")
+
+    if mode in ("어업", "전체"):
+        lines += fishing_advice(s, target_date == now.date(), active, prelim)
+    if mode in ("농업", "전체"):
+        lines += farming_advice(s, whole_day)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 6. 대화 루프
+# ---------------------------------------------------------------------------
+def main():
+    if not SERVICE_KEY:
+        print("⚠️ .env 파일에 KMA_SERVICE_KEY=발급받은키 를 넣어주세요.")
+        sys.exit(1)
+
+    print("🌊🌾 어업·농업 날씨 챗봇입니다. 종료하려면 '종료'를 입력하세요.")
+    print("예) 내일 새벽 5시 목포 출항해도 돼? / 모레 무안 농약 쳐도 돼? / 성산 풍랑주의보 내렸어? / 특보 전체")
+    print("알아듣는 장소:", ", ".join(p[0] for p in PLACES))
+    while True:
+        try:
+            q = input("\n나> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not q:
+            continue
+        if q in ("종료", "exit", "quit"):
+            break
+        try:
+            print("봇>", answer(q))
+        except Exception as e:
+            print("봇> 문제가 생겼어요:", e)
+    print("봇> 안녕히 가세요!")
+
+
+if __name__ == "__main__":
+    main()
