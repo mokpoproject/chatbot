@@ -397,17 +397,20 @@ def water_advice(rain_day, rain_next, tmax):
     return "🚿 물 주기 ○: 비 소식이 없어요. 평소대로 주세요."
 
 
-def frost_advice(night):
+def frost_advice(night, asked=False):
     """서리 판단: 새벽(0~8시) 기온·하늘·바람으로 판단.
-    서리는 맑고 바람이 약한 밤에 땅이 식으면서 잘 내립니다."""
+    서리는 맑고 바람이 약한 밤에 땅이 식으면서 잘 내립니다.
+    asked=True(질문에 '서리' 등이 있음)면 위험이 없어도 결과를 알려줍니다."""
     if not night:
-        return None
+        return "❄️ 서리: 해당 새벽 예보가 아직 없어요." if asked else None
     date_label, hours = night
     temps = [(h, to_float(v["TMP"])) for h, v in hours if "TMP" in v]
     if not temps:
-        return None
+        return "❄️ 서리: 해당 새벽 예보가 아직 없어요." if asked else None
     coldest_h, tmin = min(temps, key=lambda x: x[1])
     if tmin > 4:
+        if asked:
+            return f"✅ 서리 걱정 없음: {date_label} 새벽 최저 {tmin:.0f}°C({coldest_h}시)예요."
         return None
     clear = sum(1 for _, v in hours if v.get("SKY") == "1") >= len(hours) / 2
     calm = max(to_float(v.get("WSD")) for _, v in hours) <= 2
@@ -419,7 +422,11 @@ def frost_advice(night):
     return f"🌡️ 저온 주의: {head} - 구름이나 바람 때문에 서리 가능성은 낮지만 냉해에 주의하세요."
 
 
-def farming_advice(s, is_today=True, active=None, prelim=None, rain_day=0.0, rain_next=0.0, night=None):
+FROST_WORDS = ["서리", "냉해", "추워", "추위", "얼어", "얼음"]
+
+
+def farming_advice(s, is_today=True, active=None, prelim=None, rain_day=0.0, rain_next=0.0, night=None,
+                   asked_frost=False):
     lines = [f"🌾 농업 | 기온 {s['tmin']:.0f}~{s['tmax']:.0f}°C, 최대 풍속 {s['wsd']}m/s, 강수확률 최대 {s['pop']}%"]
     lines += farm_warning_advice(active, prelim, is_today)
 
@@ -450,7 +457,7 @@ def farming_advice(s, is_today=True, active=None, prelim=None, rain_day=0.0, rai
     lines.append(water_advice(rain_day, rain_next, s["tmax"]))
 
     # 서리
-    frost = frost_advice(night)
+    frost = frost_advice(night, asked_frost)
     if frost:
         lines.append(frost)
 
@@ -508,7 +515,8 @@ def answer(question, now=None):
         lines += fishing_advice(s, is_today, active, prelim)
     if mode in ("농업", "전체"):
         rain_day, rain_next, night = farm_context(fc, target_date, now)
-        lines += farming_advice(s, is_today, active, prelim, rain_day, rain_next, night)
+        asked_frost = any(w in question for w in FROST_WORDS)
+        lines += farming_advice(s, is_today, active, prelim, rain_day, rain_next, night, asked_frost)
     return "\n".join(lines)
 
 
