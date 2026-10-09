@@ -5,9 +5,18 @@
 chatbot.py, .env 와 같은 폴더에 두세요.
 """
 
+import importlib
+import os
+
 import streamlit as st
 
 import chatbot
+
+# chatbot.py를 고치면 Streamlit을 껐다 켜지 않아도 새 코드를 쓰도록 다시 불러옴
+_mtime = os.path.getmtime(chatbot.__file__)
+if getattr(chatbot, "_loaded_mtime", None) != _mtime:
+    chatbot = importlib.reload(chatbot)
+    chatbot._loaded_mtime = _mtime
 
 st.set_page_config(page_title="어업·농업 날씨 챗봇", page_icon="🌊")
 st.title("🌊🌾 어업·농업 날씨 챗봇")
