@@ -36,6 +36,18 @@ PLACES = [
 ]
 DEFAULT_PLACE = PLACES[0]
 
+# 출항 판단용 '앞바다' 지점 (위도, 경도)
+# 항구 좌표는 육지 격자에 걸려 파고가 0으로 나오기 때문에, 바다 위 지점의 예보로 파고·풍속을 봄
+SEA_POINTS = {
+    "무안": (34.90, 125.90),     # 신안 자은도 서쪽 바다
+    "목포항": (34.90, 125.90),
+    "해남": (34.25, 126.40),     # 땅끝 서쪽 바다
+    "제주시": (33.60, 126.53),   # 제주도 북쪽 앞바다
+    "한림항": (33.42, 126.15),   # 제주도 서쪽 앞바다
+    "성산포항": (33.46, 127.00), # 제주도 동쪽 앞바다
+    "서귀포항": (33.17, 126.56), # 제주도 남쪽 앞바다
+}
+
 # 기상특보 조회서비스 (공공데이터포털에서 따로 활용신청 필요)
 WARN_ENDPOINT = "https://apis.data.go.kr/1360000/WthrWrnInfoService/getPwnStatus"
 
@@ -311,16 +323,33 @@ def summarize(hours):
     temps = [to_float(v["TMP"]) for _, v in hours if "TMP" in v]
     waves = [to_float(v["WAV"]) for _, v in hours if "WAV" in v]
     rain_hours = [h for h, v in hours if v.get("PTY", "0") != "0" or to_float(v.get("POP")) >= 60]
+    # 육지 격자는 파고가 0으로 나옴 -> 0은 '잔잔함'이 아니라 '정보 없음'으로 처리
+    wav = max(waves) if waves else None
+    if wav is not None and wav <= 0:
+        wav = None
     return {
         "tmin": min(temps) if temps else None,
         "tmax": max(temps) if temps else None,
         "wsd": max((to_float(v.get("WSD")) for _, v in hours), default=0.0),
-        "wav": max(waves) if waves else None,  # 바다가 아닌 격자면 파고가 없을 수 있음
+        "wav": wav,
         "pop": max((int(to_float(v.get("POP"))) for _, v in hours), default=0),
         "rain_total": sum(rain_mm(v.get("PCP")) for _, v in hours),
         "rain_hours": rain_hours,
-        "sky": SKY.get(hours[0][1].get("SKY", ""), ""),
+        "sky": describe_sky(hours, rain_hours),
     }
+
+
+def describe_sky(hours, rain_hours):
+    """하루 날씨 한 줄 요약: 가장 많은 하늘 상태 + 비/눈 오는 시간대"""
+    skies = [SKY.get(v.get("SKY", ""), "") for _, v in hours]
+    skies = [x for x in skies if x]
+    main = max(set(skies), key=skies.count) if skies else ""
+    if not rain_hours:
+        return main
+    kinds = [PTY.get(v.get("PTY", "0"), "비") for h, v in hours if h in rain_hours and v.get("PTY", "0") != "0"]
+    kind = max(set(kinds), key=kinds.count) if kinds else "비"
+    span = f"{rain_hours[0]}시" if rain_hours[0] == rain_hours[-1] else f"{rain_hours[0]}~{rain_hours[-1]}시"
+    return f"{main}, {span} {kind}" if main else f"{span} {kind}"
 
 
 # ---------------------------------------------------------------------------
@@ -344,14 +373,15 @@ def fishing_advice(s, is_today=True, active=None, prelim=None):
         verdict = "⚠️ 출항 주의: 풍랑 예비특보가 있어요. 특보로 바뀔 수 있으니 출발 전에 다시 확인하세요."
     elif wsd >= 9 or (wav is not None and wav >= 2):
         verdict = "⚠️ 출항 주의: 소형 어선은 위험할 수 있어요. 가까운 바다에서 짧게 조업하세요."
+    elif wav is None:
+        # 파고를 모르는데 '양호'라고 하면 위험한 오판이 될 수 있음
+        verdict = "⚠️ 판단 보류: 바람은 약하지만 파고 정보가 없어요. 해상예보로 파도를 꼭 확인하세요."
     else:
         verdict = "✅ 출항 양호: 바람과 파도가 잔잔한 편이에요."
 
     lines = [head, verdict]
     if s["rain_hours"]:
         lines.append(f"☔ {s['rain_hours'][0]}시~{s['rain_hours'][-1]}시 비 소식, 시야와 갑판 미끄럼에 주의하세요.")
-    if wav is None:
-        lines.append("ℹ️ 이 지점은 파고 예보가 없어요. 해상예보를 함께 확인하세요.")
     return lines
 
 
@@ -512,12 +542,28 @@ def answer(question, now=None):
         lines.append(f"📢 특보 확인 실패: {str(e).splitlines()[0]}")
 
     if mode in ("어업", "전체"):
-        lines += fishing_advice(s, is_today, active, prelim)
+        lines += fishing_advice(sea_summary(name, s, date_str, [h for h, _ in hours], now),
+                                is_today, active, prelim)
     if mode in ("농업", "전체"):
         rain_day, rain_next, night = farm_context(fc, target_date, now)
         asked_frost = any(w in question for w in FROST_WORDS)
         lines += farming_advice(s, is_today, active, prelim, rain_day, rain_next, night, asked_frost)
     return "\n".join(lines)
+
+
+def sea_summary(name, s, date_str, hour_list, now):
+    """출항 판단용: 앞바다 지점 예보로 풍속·파고를 바꿔 넣음 (실패하면 육지 값 그대로)"""
+    if name not in SEA_POINTS:
+        return s
+    try:
+        sea_fc = fetch_forecast(*latlon_to_grid(*SEA_POINTS[name]), now)
+    except Exception:
+        return s
+    sea_hours = [(h, sea_fc[(date_str, f"{h:02d}00")]) for h in hour_list if (date_str, f"{h:02d}00") in sea_fc]
+    if not sea_hours:
+        return s
+    sea = summarize(sea_hours)
+    return {**s, "wsd": sea["wsd"], "wav": sea["wav"]}
 
 
 def farm_context(fc, target_date, now):
