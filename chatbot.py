@@ -343,8 +343,6 @@ def fishing_advice(s, is_today=True, active=None, prelim=None):
     elif sea_prelim:
         verdict = "⚠️ 출항 주의: 풍랑 예비특보가 있어요. 특보로 바뀔 수 있으니 출발 전에 다시 확인하세요."
     elif wsd >= 9 or (wav is not None and wav >= 2):
-        verdict = "⛔ 출항 위험: 풍랑주의보 수준의 바람·파도예요. 출항하지 마세요."
-    elif wsd >= 9 or (wav is not None and wav >= 2):
         verdict = "⚠️ 출항 주의: 소형 어선은 위험할 수 있어요. 가까운 바다에서 짧게 조업하세요."
     else:
         verdict = "✅ 출항 양호: 바람과 파도가 잔잔한 편이에요."
@@ -357,11 +355,79 @@ def fishing_advice(s, is_today=True, active=None, prelim=None):
     return lines
 
 
-def farming_advice(s, date_is_whole_day):
+# 특보 종류별로 농가가 할 일 (순서대로 확인)
+FARM_WARN_ACTIONS = [
+    ("태풍", "하우스를 단단히 고정하고, 거둘 수 있는 작물은 미리 수확하세요. 바람이 불 때는 밭에 나가지 마세요."),
+    ("호우", "배수로와 물꼬를 미리 정비하고, 거둘 수 있는 작물은 미리 수확하세요."),
+    ("강풍", "비닐하우스 고정끈·출입문을 점검하고, 지주대를 단단히 묶어두세요."),
+    ("한파", "하우스 보온·난방을 점검하고, 노지 작물은 덮개를 씌우세요. 수도관 동파에 주의하세요."),
+    ("대설", "하우스 지붕의 눈을 수시로 털어주고, 필요하면 지지대를 보강하세요."),
+    ("폭염", "한낮(12~17시) 작업은 피하고, 하우스 환기와 물 주기를 늘리세요."),
+    ("건조", "불씨에 주의하고, 논·밭두렁 태우기는 하지 마세요."),
+]
+
+
+def farm_warning_advice(active, prelim, is_today):
+    """발효 중인 특보·예비특보를 농가 행동으로 바꿔줍니다 (풍랑 같은 바다 특보는 제외)."""
+    lines = []
+    for name, _ in active or []:
+        for key, action in FARM_WARN_ACTIONS:
+            if key in name:
+                when = "발효 중" if is_today else "지금 발효 중(그날까지 이어질 수 있어요)"
+                lines.append(f"🚨 {name} {when}: {action}")
+                break
+    for title, when, _ in prelim or []:
+        for key, action in FARM_WARN_ACTIONS:
+            if key in title:
+                lines.append(f"🔔 {title}({when}): 특보로 바뀔 수 있어요. {action}")
+                break
+    return lines
+
+
+def water_advice(rain_day, rain_next, tmax):
+    """물 주기 판단: 그날과 다음 날 예상 강수량 기준"""
+    if rain_day >= 10:
+        return f"🚿 물 주기 ✗: 약 {rain_day:.0f}mm 비 예보라 물 안 줘도 돼요."
+    if rain_day >= 1:
+        return f"🚿 물 주기 △: 비가 약 {rain_day:.0f}mm로 적게 와요. 흙이 마르면 주세요."
+    if rain_next >= 10:
+        return f"🚿 물 주기 △: 다음 날 약 {rain_next:.0f}mm 비 예보라 오늘은 조금만 주세요."
+    if tmax is not None and tmax >= 25:
+        return "🚿 물 주기 ○: 비 소식 없고 더워요. 아침이나 저녁 선선할 때 주세요."
+    return "🚿 물 주기 ○: 비 소식이 없어요. 평소대로 주세요."
+
+
+def frost_advice(night):
+    """서리 판단: 새벽(0~8시) 기온·하늘·바람으로 판단.
+    서리는 맑고 바람이 약한 밤에 땅이 식으면서 잘 내립니다."""
+    if not night:
+        return None
+    date_label, hours = night
+    temps = [(h, to_float(v["TMP"])) for h, v in hours if "TMP" in v]
+    if not temps:
+        return None
+    coldest_h, tmin = min(temps, key=lambda x: x[1])
+    if tmin > 4:
+        return None
+    clear = sum(1 for _, v in hours if v.get("SKY") == "1") >= len(hours) / 2
+    calm = max(to_float(v.get("WSD")) for _, v in hours) <= 2
+    head = f"{date_label} 새벽 최저 {tmin:.0f}°C({coldest_h}시)"
+    if tmin <= 0:
+        return f"❄️ 서리·냉해 위험: {head} - 영하라 노지 작물은 덮개를 씌우고, 수확할 작물은 미리 거두세요."
+    if clear and calm:
+        return f"❄️ 서리 가능성 높음: {head}, 맑고 바람이 약해요 - 보온 덮개를 준비하세요."
+    return f"🌡️ 저온 주의: {head} - 구름이나 바람 때문에 서리 가능성은 낮지만 냉해에 주의하세요."
+
+
+def farming_advice(s, is_today=True, active=None, prelim=None, rain_day=0.0, rain_next=0.0, night=None):
     lines = [f"🌾 농업 | 기온 {s['tmin']:.0f}~{s['tmax']:.0f}°C, 최대 풍속 {s['wsd']}m/s, 강수확률 최대 {s['pop']}%"]
+    lines += farm_warning_advice(active, prelim, is_today)
 
     # 농약 살포: 비가 오면 씻겨 내려가고, 바람이 세면 날려서 옆 밭에 피해
-    if s["rain_hours"]:
+    storm = [n for n, _ in (active or []) if "호우" in n or "태풍" in n]
+    if is_today and storm:
+        lines.append(f"🧪 농약 살포 ✗: {storm[0]} 발효 중이라 약이 씻겨 내려가요.")
+    elif s["rain_hours"]:
         lines.append(f"🧪 농약 살포 ✗: {s['rain_hours'][0]}시쯤부터 비 소식이 있어 약이 씻겨 내려가요.")
     elif s["wsd"] >= 4:
         lines.append(f"🧪 농약 살포 ✗: 바람({s['wsd']}m/s)이 세서 약이 날려요. 바람 잦을 때 하세요.")
@@ -380,9 +446,14 @@ def farming_advice(s, date_is_whole_day):
     if s["wsd"] >= 9:
         lines.append("💨 강풍 주의: 비닐하우스 고정끈과 출입문을 점검하세요.")
 
-    # 서리 / 폭염 (하루 전체를 볼 때만 의미 있음)
-    if date_is_whole_day and s["tmin"] is not None and s["tmin"] <= 3:
-        lines.append(f"❄️ 서리 주의: 최저 {s['tmin']:.0f}°C - 보온 덮개를 준비하세요.")
+    # 물 주기
+    lines.append(water_advice(rain_day, rain_next, s["tmax"]))
+
+    # 서리
+    frost = frost_advice(night)
+    if frost:
+        lines.append(frost)
+
     if s["tmax"] is not None and s["tmax"] >= 33:
         lines.append(f"🥵 폭염 주의: 최고 {s['tmax']:.0f}°C - 한낮 작업은 피하고 물을 자주 드세요.")
     return lines
@@ -409,12 +480,10 @@ def answer(question, now=None):
     if hour is not None:
         hours = [(h, v) for h, v in day_hours if hour <= h < hour + WORK_HOURS]
         period = f"{hour}시~{hour + WORK_HOURS}시"
-        whole_day = False
     else:
         start = now.hour if target_date == now.date() else 0
         hours = [(h, v) for h, v in day_hours if h >= start]
         period = "하루" if start == 0 else f"{start}시 이후"
-        whole_day = start == 0
 
     if not hours:
         return f"{name} 해당 시간 예보가 아직 없거나 이미 지난 시간이에요. (단기예보는 약 3~4일 뒤까지 제공돼요)"
@@ -422,20 +491,41 @@ def answer(question, now=None):
     s = summarize(hours)
     lines = [f"[{name} {date_str[4:6]}/{date_str[6:]} {period}] {s['sky']}"]
 
-    # 어업 질문이면 특보도 자동으로 확인 (특보는 '지금' 기준이라 오늘이 아니면 주의로만 반영)
+    # 특보 자동 확인 (특보는 '지금' 기준이라 오늘이 아니면 주의로만 반영)
+    is_today = target_date == now.date()
     active, prelim = [], []
-    if mode in ("어업", "전체"):
-        try:
-            warn_lines, active, prelim = warning_lines(name, fetch_warnings(now))
+    try:
+        warn_lines, active, prelim = warning_lines(name, fetch_warnings(now))
+        # 예비특보는 보통 하루 이틀 안의 일이라, 그보다 먼 날 질문에는 반영하지 않음
+        if (target_date - now.date()).days > 1:
+            prelim = []
+        if mode in ("어업", "전체"):
             lines += warn_lines
-        except Exception as e:
-            lines.append(f"📢 특보 확인 실패: {str(e).splitlines()[0]}")
+    except Exception as e:
+        lines.append(f"📢 특보 확인 실패: {str(e).splitlines()[0]}")
 
     if mode in ("어업", "전체"):
-        lines += fishing_advice(s, target_date == now.date(), active, prelim)
+        lines += fishing_advice(s, is_today, active, prelim)
     if mode in ("농업", "전체"):
-        lines += farming_advice(s, whole_day)
+        rain_day, rain_next, night = farm_context(fc, target_date, now)
+        lines += farming_advice(s, is_today, active, prelim, rain_day, rain_next, night)
     return "\n".join(lines)
+
+
+def farm_context(fc, target_date, now):
+    """물 주기·서리 판단용: 그날/다음 날 강수량, 확인할 새벽 시간대"""
+    def day_rain(d):
+        ds = d.strftime("%Y%m%d")
+        return sum(rain_mm(v.get("PCP")) for (dd, _), v in fc.items() if dd == ds)
+
+    next_date = target_date + timedelta(days=1)
+    # 오늘 아침 8시가 지났으면 '다음 날 새벽' 서리를 봄
+    frost_date = next_date if (target_date == now.date() and now.hour >= 8) else target_date
+    fd = frost_date.strftime("%Y%m%d")
+    night_hours = sorted((int(t[:2]), v) for (d, t), v in fc.items() if d == fd and int(t[:2]) <= 8)
+    label = {0: "오늘", 1: "내일", 2: "모레"}.get((frost_date - now.date()).days, frost_date.strftime("%m/%d"))
+    night = (label, night_hours) if night_hours else None
+    return day_rain(target_date), day_rain(next_date), night
 
 
 # ---------------------------------------------------------------------------
